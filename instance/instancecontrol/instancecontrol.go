@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,33 +32,95 @@ type InstanceRecord struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	LastError string    `json:"last_error,omitempty"`
 }
-type Controller struct {
-	gracePeriod time.Duration
+
+type DB interface {
+	Set(key string, value interface{}) error
+	Get(key string) (interface{}, error)
 }
 
-func NewController() *Controller { return &Controller{gracePeriod: 10 * time.Second} }
-func dbKeyFor(path string) (string, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	return "instancecontrol:" + abs, nil
+type mineDBAdapter struct{}
+
+func (m mineDBAdapter) Set(key string, value interface{}) error {
+	return mine_db.Set(key, value)
 }
+
+func (m mineDBAdapter) Get(key string) (interface{}, error) {
+	return mine_db.Get(key)
+}
+
+type Controller struct {
+	gracePeriod time.Duration
+	defaultCmd  []string
+	useAbsPaths bool
+	db          DB
+	watchLock   sync.Mutex
+}
+
+type Option func(*Controller)
+
+func WithGracePeriod(d time.Duration) Option {
+	return func(c *Controller) {
+		c.gracePeriod = d
+	}
+}
+
+func WithDefaultCmd(cmd []string) Option {
+	return func(c *Controller) {
+		c.defaultCmd = append([]string(nil), cmd...)
+	}
+}
+
+func WithUseAbsPaths(use bool) Option {
+	return func(c *Controller) {
+		c.useAbsPaths = use
+	}
+}
+
+func WithDB(db DB) Option {
+	return func(c *Controller) {
+		c.db = db
+	}
+}
+
+func NewController(opts ...Option) *Controller {
+	c := &Controller{
+		gracePeriod: 10 * time.Second,
+		useAbsPaths: true,
+		db:          mineDBAdapter{},
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+func (c *Controller) formatDBKey(path string) (string, error) {
+	if c.useAbsPaths {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		return "instancecontrol:" + abs, nil
+	}
+	return "instancecontrol:" + path, nil
+}
+
 func (c *Controller) saveRecord(path string, r InstanceRecord) error {
-	key, err := dbKeyFor(path)
+	key, err := c.formatDBKey(path)
 	if err != nil {
 		return err
 	}
 	r.UpdatedAt = time.Now().UTC()
-	return mine_db.Set(key, r)
+	return c.db.Set(key, r)
 }
+
 func (c *Controller) loadRecord(path string) (InstanceRecord, error) {
 	var r InstanceRecord
-	key, err := dbKeyFor(path)
+	key, err := c.formatDBKey(path)
 	if err != nil {
 		return r, err
 	}
-	v, err := mine_db.Get(key)
+	v, err := c.db.Get(key)
 	if err != nil {
 		r.State = StateUnknown
 		r.UpdatedAt = time.Now().UTC()
@@ -72,28 +135,44 @@ func (c *Controller) loadRecord(path string) (InstanceRecord, error) {
 	}
 	return r, nil
 }
+
 func isPidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
-	return err == nil
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	return false
 }
+
 func (c *Controller) Start(targetPath string, launchCmd []string) error {
 	absPath, err := filepath.Abs(targetPath)
 	if err != nil {
 		return err
 	}
-	rec, _ := c.loadRecord(absPath)
+	rec, err := c.loadRecord(absPath)
+	if err != nil {
+		return err
+	}
 	if rec.PID != 0 && isPidAlive(rec.PID) {
 		return nil
 	}
-	if len(launchCmd) == 0 {
+	if len(launchCmd) == 0 && len(c.defaultCmd) == 0 {
 		return errors.New("launch command required")
+	}
+	if len(launchCmd) == 0 {
+		launchCmd = append([]string(nil), c.defaultCmd...)
 	}
 	cmd := exec.Command(launchCmd[0], launchCmd[1:]...)
 	cmd.Dir = absPath
-	_ = os.MkdirAll(filepath.Join(absPath, "logs"), 0755)
+	if err := os.MkdirAll(filepath.Join(absPath, "logs"), 0755); err != nil {
+		return err
+	}
 	stdoutF, _ := os.OpenFile(filepath.Join(absPath, "logs", "stdout.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	stderrF, _ := os.OpenFile(filepath.Join(absPath, "logs", "stderr.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if stdoutF != nil {
@@ -102,42 +181,64 @@ func (c *Controller) Start(targetPath string, launchCmd []string) error {
 	if stderrF != nil {
 		cmd.Stderr = stderrF
 	}
-	_ = c.saveRecord(absPath, InstanceRecord{State: StateStarting})
-	if err := cmd.Start(); err != nil {
-		_ = c.saveRecord(absPath, InstanceRecord{State: StateFailed, LastError: err.Error()})
-		return err
-	}
-	pid := cmd.Process.Pid
-	_ = c.saveRecord(absPath, InstanceRecord{State: StateRunning, PID: pid, StartedAt: time.Now().UTC()})
-	go func() {
-		err := cmd.Wait()
-		rec := InstanceRecord{UpdatedAt: time.Now().UTC()}
-		if err != nil {
-			rec.State = StateFailed
-			rec.LastError = err.Error()
-		} else {
-			rec.State = StateStopped
-			rec.StoppedAt = time.Now().UTC()
-		}
-		rec.PID = 0
-		_ = c.saveRecord(absPath, rec)
+	if err := c.saveRecord(absPath, InstanceRecord{State: StateStarting}); err != nil {
 		if stdoutF != nil {
 			_ = stdoutF.Close()
 		}
 		if stderrF != nil {
 			_ = stderrF.Close()
 		}
-	}()
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = c.saveRecord(absPath, InstanceRecord{State: StateFailed, LastError: err.Error()})
+		if stdoutF != nil {
+			_ = stdoutF.Close()
+		}
+		if stderrF != nil {
+			_ = stderrF.Close()
+		}
+		return err
+	}
+	pid := cmd.Process.Pid
+	_ = c.saveRecord(absPath, InstanceRecord{State: StateRunning, PID: pid, StartedAt: time.Now().UTC()})
+	go c.watchProcess(absPath, cmd, stdoutF, stderrF)
 	return nil
 }
+
+func (c *Controller) watchProcess(absPath string, cmd *exec.Cmd, stdoutF, stderrF *os.File) {
+	c.watchLock.Lock()
+	defer c.watchLock.Unlock()
+	err := cmd.Wait()
+	rec := InstanceRecord{UpdatedAt: time.Now().UTC()}
+	if err != nil {
+		rec.State = StateFailed
+		rec.LastError = err.Error()
+	} else {
+		rec.State = StateStopped
+		rec.StoppedAt = time.Now().UTC()
+	}
+	rec.PID = 0
+	_ = c.saveRecord(absPath, rec)
+	if stdoutF != nil {
+		_ = stdoutF.Close()
+	}
+	if stderrF != nil {
+		_ = stderrF.Close()
+	}
+}
+
 func (c *Controller) Stop(targetPath string) error {
 	absPath, err := filepath.Abs(targetPath)
 	if err != nil {
 		return err
 	}
-	rec, _ := c.loadRecord(absPath)
+	rec, err := c.loadRecord(absPath)
+	if err != nil {
+		return err
+	}
 	if rec.PID == 0 || !isPidAlive(rec.PID) {
-		_ = c.saveRecord(absPath, InstanceRecord{State: StateStopped})
+		_ = c.saveRecord(absPath, InstanceRecord{State: StateStopped, StoppedAt: time.Now().UTC()})
 		return nil
 	}
 	pid := rec.PID
@@ -159,6 +260,7 @@ func (c *Controller) Stop(targetPath string) error {
 	_ = c.saveRecord(absPath, InstanceRecord{State: StateStopped, StoppedAt: time.Now().UTC()})
 	return nil
 }
+
 func (c *Controller) GetState(targetPath string) (InstanceRecord, error) {
 	absPath, err := filepath.Abs(targetPath)
 	var r InstanceRecord
